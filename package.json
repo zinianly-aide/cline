@@ -442,7 +442,8 @@
 		"docs:rename-file": "cd docs && npm run rename",
 		"report-issue": "node scripts/report-issue.js",
 		"storybook": "cd webview-ui && npm run storybook",
-		"cli:unlink": "cd cli && npm run unlink"
+		"cli:unlink": "cd cli && npm run unlink",
+		"dify:proxy": "node scripts/dify-proxy/server.mjs"
 	},
 	"lint-staged": {
 		"src/shared/storage/state-keys.ts": [
