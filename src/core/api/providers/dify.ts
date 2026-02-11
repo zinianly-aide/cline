@@ -80,6 +80,7 @@ export class DifyHandler implements ApiHandler {
 	private conversationId: string | null = null
 	private currentTaskId: string | null = null
 	private abortController: AbortController | null = null
+	private lastMessageAnswer = ""
 
 	constructor(options: DifyHandlerOptions) {
 		this.options = options
@@ -100,6 +101,7 @@ export class DifyHandler implements ApiHandler {
 	}
 
 	async *createMessage(systemPrompt: string, messages: ClineStorageMessage[]): ApiStream {
+		this.lastMessageAnswer = ""
 		Logger.log("[DIFY DEBUG] createMessage called with:", {
 			systemPromptLength: systemPrompt?.length || 0,
 			messagesCount: messages?.length || 0,
@@ -122,10 +124,12 @@ export class DifyHandler implements ApiHandler {
 
 		let response: Response
 		try {
+			this.abortController = new AbortController()
 			response = await fetch(fullUrl, {
 				method: "POST",
 				headers: this.jsonHeaders(),
 				body: JSON.stringify(requestBody),
+				signal: this.abortController.signal,
 			})
 		} catch (error: any) {
 			Logger.error("[DIFY DEBUG] Network error during fetch:", error)
@@ -215,11 +219,15 @@ export class DifyHandler implements ApiHandler {
 							}
 
 							// Handle different Dify event types based on actual Dify API
+							if (parsed.task_id) {
+								this.currentTaskId = parsed.task_id
+							}
+
 							if (parsed.event === "message") {
 								Logger.log("[DIFY DEBUG] Message event, answer:", parsed.answer)
-								// Dify sends the full text in each "answer" chunk, so we replace.
+								// Dify 不同应用配置下 answer 可能是“全量文本”或“增量片段”，这里做自适应合并。
 								if (typeof parsed.answer === "string") {
-									fullText = parsed.answer
+									fullText = this.mergeAnswerChunk(fullText, parsed.answer)
 									Logger.log("[DIFY DEBUG] Updated fullText length:", fullText.length)
 									yield {
 										type: "text",
@@ -231,6 +239,7 @@ export class DifyHandler implements ApiHandler {
 								Logger.log("[DIFY DEBUG] Replace message event:", parsed)
 								if (parsed.answer) {
 									fullText = parsed.answer // Replace instead of append
+									this.lastMessageAnswer = parsed.answer
 									Logger.log("[DIFY DEBUG] Replaced fullText length:", fullText.length)
 									yield {
 										type: "text",
@@ -289,7 +298,7 @@ export class DifyHandler implements ApiHandler {
 									hasYieldedContent = true
 								} else if (parsed.answer) {
 									// Fallback: some events might have answer field even if not "message" type
-									fullText += parsed.answer
+									fullText = this.mergeAnswerChunk(fullText, parsed.answer)
 									yield {
 										type: "text",
 										text: fullText,
@@ -313,7 +322,7 @@ export class DifyHandler implements ApiHandler {
 
 							// Handle the same event types as above
 							if (parsed.event === "message" && parsed.answer) {
-								fullText += parsed.answer
+								fullText = this.mergeAnswerChunk(fullText, parsed.answer)
 								yield {
 									type: "text",
 									text: fullText,
@@ -334,7 +343,7 @@ export class DifyHandler implements ApiHandler {
 							} else if (parsed.answer || parsed.text || parsed.content) {
 								// Fallback for any content in direct JSON
 								const content = parsed.answer || parsed.text || parsed.content
-								fullText += content
+								fullText = this.mergeAnswerChunk(fullText, content)
 								yield {
 									type: "text",
 									text: fullText,
@@ -377,10 +386,28 @@ export class DifyHandler implements ApiHandler {
 					)
 				}
 			}
-		} finally {
-			reader.releaseLock()
-			Logger.log("[DIFY DEBUG] Stream reader released")
+			} finally {
+				this.abortController = null
+				reader.releaseLock()
+				Logger.log("[DIFY DEBUG] Stream reader released")
+			}
+	}
+
+	private mergeAnswerChunk(currentText: string, incomingText: string): string {
+		if (!incomingText) {
+			return currentText
 		}
+
+		// 情况 1：Dify 返回的是全量文本（新文本以旧文本为前缀）
+		if (incomingText.startsWith(this.lastMessageAnswer)) {
+			this.lastMessageAnswer = incomingText
+			return incomingText
+		}
+
+		// 情况 2：Dify 返回的是增量 token/片段
+		const merged = currentText + incomingText
+		this.lastMessageAnswer = merged
+		return merged
 	}
 
 	private convertMessagesToQuery(systemPrompt: string, messages: ClineStorageMessage[]): string {
@@ -638,6 +665,23 @@ export class DifyHandler implements ApiHandler {
 	resetConversation(): void {
 		this.conversationId = null
 		this.currentTaskId = null
+		this.lastMessageAnswer = ""
+	}
+
+	async cancel(user: string = "cline-user"): Promise<void> {
+		try {
+			this.abortController?.abort()
+		} catch (error) {
+			Logger.warn("[DIFY DEBUG] Failed to abort local stream:", error)
+		}
+
+		if (this.currentTaskId) {
+			try {
+				await this.stopGeneration(this.currentTaskId, user)
+			} catch (error) {
+				Logger.warn("[DIFY DEBUG] Failed to stop remote generation:", error)
+			}
+		}
 	}
 
 	private jsonHeaders() {
